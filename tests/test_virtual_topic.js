@@ -4,15 +4,13 @@
  */
 var amqp = require('./amqp');
 
-var connection = amqp.getConnection(false);
-var c2 = amqp.getConnection(false);
+var connection = amqp.getConnection(true);
 
-var t = {address:'topic://VirtualTopic.Tests'};
-var p = amqp.getSender(connection, {target: t,durable: 2});
-var r10 = amqp.getReceiver(c2, {source: {address: 'queue://Consumer.r1.VirtualTopic.Tests'}, durable: 2});
-var r11 = amqp.getReceiver(c2, {source: {address: 'queue://Consumer.r1.VirtualTopic.Tests'}, durable: 2});
-var r20 = amqp.getReceiver(c2, {source: {address: 'queue://Consumer.r2.VirtualTopic.Tests'}, durable: 2});
-var r21 = amqp.getReceiver(c2, {source: {address: 'queue://Consumer.r2.VirtualTopic.Tests'}, durable: 2});
+var p = amqp.getSender(connection);
+var r10 = amqp.getReceiver(connection, {source: {address: 'queue://Consumer.r1.VirtualTopic.Tests.message', durable: 2}, name:'testSub1'});
+var r11 = amqp.getReceiver(connection, {source: {address: 'queue://Consumer.r1.VirtualTopic.Tests.message', durable: 2}, name:'testSub2'});
+var r20 = amqp.getReceiver(connection, {source: {address: 'queue://Consumer.r2.VirtualTopic.Tests.message', durable: 2}, name:'testSub3'});
+var r21 = amqp.getReceiver(connection, {source: {address: 'queue://Consumer.r2.VirtualTopic.Tests.message', durable: 2}, name:'testSub4'});
 
 amqp.sub(r10);
 amqp.sub(r11);
@@ -22,6 +20,6 @@ amqp.sub(r21);
 
 var sent = 0;
 connection.on('sendable', function(sender){
-  console.log('got sendable single');
-  amqp.pub(sender, null, null, {body:'sequence-' + (++sent)}, null);
+  var addr = 'topic://VirtualTopic.Tests.message';
+  amqp.pub(sender, null, null, {to:addr, body:'sequence-' + (sent++)}, null);
 });

@@ -7,9 +7,15 @@ module.exports = {
     var hostInfo = hosts;
     if(auth){
       hostInfo.user = 'user';
-      hostInfo.pass = 'password';
+      hostInfo.password = 'password';
     }
     var connection = c.connect(hostInfo);
+    connection.on('connection_closed', function(){
+      console.log('connection closed');
+    });
+    connection.on('connection_opened', function(){
+      console.log('connection opened');
+    });
     return connection;
   },
 

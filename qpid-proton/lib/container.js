@@ -118,12 +118,19 @@ Sender.prototype.send = function (message, tag) {
     outgoing.free();
 };
 
-var Receiver = function (connection, receiver) {
+var Receiver = function (connection, receiver, options) {
     this.connection = connection;
     this.link = receiver;
     this.name = this.link.get_name();
     this.role = 'receiver';
-    this.link.flow(1);
+    if (!options || options.prefetch === undefined) {
+        this.prefetch = 500;
+    } else {
+        this.prefetch = options.prefetch;
+    }
+    if (this.prefetch) {
+        this.link.flow(this.prefetch);
+    }
 };
 
 Receiver.prototype = Object.create(EventEmitter.prototype);
@@ -152,26 +159,26 @@ Receiver.prototype.detach = function () {
 
 var conn_counter = 1;
 
-var Connection = function (container) {
+var Connection = function (container, options) {
+    this.options = options ? options : {};
     this.conn = proton.connection();
-    this.transport = proton.transport();
-    this.transport.bind(this.conn);
+    if (this.options.user) {
+        this.conn.set_user(this.options.user);
+    }
+    if (this.options.password) {
+        this.conn.set_password(this.options.password);
+    }
+    if (this.options.id) {
+        this.conn.set_container(options.id);
+    } else {
+        this.conn.set_container(container.container_id);
+    }
     this.collector = proton.collector();
     this.conn.collect(this.collector);
     this.container = container;
-    this.conn.set_container(container.container_id);
     this.conn.open();
     this.links = {};
     this.id = 'connection-' + conn_counter++;
-};
-
-Connection.prototype = Object.create(EventEmitter.prototype);
-Connection.prototype.constructor = Connection;
-
-Connection.prototype.initialise = function (socket) {
-    this.socket = socket;
-    this.socket.on('data', this.input.bind(this));
-    this.socket.on('end', this.eof.bind(this));
 
     //setup internal event handlers:
     this.on('PN_CONNECTION_REMOTE_OPEN', this.connection_remote_open.bind(this));
@@ -180,10 +187,19 @@ Connection.prototype.initialise = function (socket) {
     this.on('PN_LINK_REMOTE_OPEN', this.link_remote_open.bind(this));
     this.on('PN_LINK_FLOW', this.link_flow.bind(this));
     this.on('PN_DELIVERY', this.delivery.bind(this));
-    this.on('PN_TRANSPORT_CLOSED', function() { socket.end(); });
+    this.on('PN_TRANSPORT_CLOSED', this.transport_closed.bind(this));
     //this.on('PN_TRANSPORT', this.output);
+};
 
-    return this;
+Connection.prototype = Object.create(EventEmitter.prototype);
+Connection.prototype.constructor = Connection;
+
+Connection.prototype.initialise = function (socket) {
+    this.socket = socket;
+    this.socket.on('data', this.input.bind(this));
+    this.socket.on('error', this.eof.bind(this));
+    this.socket.on('end', this.eof.bind(this));
+    this.data = [];
 };
 
 Connection.prototype.session = function (socket) {
@@ -195,9 +211,16 @@ Connection.prototype.session = function (socket) {
     return this.ssn;
 };
 
-Connection.prototype.connect = function (options) {
-    var socket = net.connect({host: options.host, port: options.port}, this.connected.bind(this));
-    return this.initialise(socket);
+Connection.prototype.connect = function () {
+    try {
+        var socket = net.connect(this.options, this.connected.bind(this));
+        this.initialise(socket);
+    } catch (e) {
+        console.log(e);
+        //TODO: exponential backoff up to some limit
+        setTimeout(this.connect.bind(this), 500);
+    }
+    return this;
 };
 
 Connection.prototype.connection_remote_open = function (event) {
@@ -219,6 +242,18 @@ Connection.prototype.connection_remote_close = function (event) {
         this.conn.close();
     }
     this.conn.free();
+};
+
+Connection.prototype.is_closed = function (event) {
+    return this.conn.get_state() & (proton.PN_LOCAL_CLOSED | proton.PN_REMOTE_CLOSED);
+}
+
+Connection.prototype.transport_closed = function (event) {
+    if (this.is_closed()) {
+        if (this.socket) {
+            this.socket.end();
+        }
+    }
 };
 
 Connection.prototype.session_remote_open = function (event) {
@@ -282,6 +317,7 @@ Connection.prototype.delivery = function (event) {
             if (dlv.settled()) {
                 dispatch([context, this, this.container], 'settled', dlv, context);
             }
+            dlv.settle();
         }
     } else {
         if (debug) console.log('[' + this.id + '] receiver ' + context.name + ' handling incoming delivery event');
@@ -291,8 +327,9 @@ Connection.prototype.delivery = function (event) {
             var message = from_proton_message(incoming);
             dispatch([context, this, this.container], 'message', message, context);
             if (debug) console.log('[' + this.id + '] receiver ' + context.name + ' received message');
-            context.link.flow(1);
-            //TODO: accept
+            if (context.prefetch) {
+                context.link.flow(context.prefetch - context.link.credit());
+            }
             dlv.set_local_state(proton.PN_ACCEPTED);
             dlv.settle();
         } else {
@@ -305,28 +342,49 @@ Connection.prototype.delivery = function (event) {
 Connection.prototype.connected = function () {
     if (debug) console.log('[' + this.id + '] connected to server: ' + get_socket_id(this.socket));
 
+    var old = this.transport;
+    if (old) {
+        old.unbind();
+        old.free();
+    }
+    this.transport = proton.transport();
+    this.transport.bind(this.conn);
+
     this.process();
 };
 
 Connection.prototype.input = function (buff) {
-    if (debug) console.log('[' + this.id + '] entered input()');
-    if (debug) console.log('[' + this.id + '] received ' + buff.length + ' bytes of data');
-    var data = [];
-    var pushed;
+    if (debug) console.log('[' + this.id + '] entering input(): received ' + buff.length + ' bytes of data (' + this.data.length + ' unprocessed bytes already received)');
+    var total_pushed = 0, pushed;
     var i;
     for (i = 0; i < buff.length; i++) {
-        data.push(buff.readInt8(i));
+        this.data.push(buff.readInt8(i));
     }
-    pushed = this.transport.push(data);
-
-    this.process();
-    if (debug) console.log('[' + this.id + '] returning from input(): pushed ' + pushed + ' of ' + buff.length);
+    do {
+        pushed = this.transport.push(this.data);
+        total_pushed += pushed;
+        this.process();
+        if (pushed < this.data.length) {
+            this.data = this.data.slice(pushed);
+        } else {
+            this.data = []
+        }
+        if (debug) console.log('[' + this.id + '] returning from input(): pushed ' + total_pushed + ' (' + this.data.length + ' remaining)');
+    } while (pushed > 0);
 };
 
 Connection.prototype.eof = function (data) {
-    if (debug) console.log('[' + this.id + '] disconnected from server');
-    this.transport.close_head();
-    this.transport.close_tail();
+    if (debug) console.log('[' + this.id + '] disconnected');
+    if (this.transport) {
+        this.transport.close_head();
+        this.transport.close_tail();
+    }
+    if (!this.is_closed() && this.options.reconnect) {
+        console.log('Disconnected, reconnecting....');
+        //TODO: exponential backoff up to some limit
+        setTimeout(this.connect.bind(this), 500);
+        dispatch([this, this.container], 'disconnected', this);
+    }
 };
 
 Connection.prototype.in_process = false;
@@ -337,7 +395,11 @@ Connection.prototype.process = function () {
         var do_output;
         do {
             //var next = new Date(this.transport.tick(new Date().getTime()));
-            do_output = false;
+            if (do_output === undefined) {
+                do_output = true;
+            } else {
+                do_output = false;
+            }
             var event = this.collector.peek();
             while (event) {
                 if (debug) console.log('[' + this.id + '] Got event: ' + event.type());
@@ -355,6 +417,7 @@ Connection.prototype.process = function () {
 };
 
 Connection.prototype.output = function () {
+    if (this.transport === undefined) return;
     if (debug) console.log('[' + this.id + '] entered output()');
     var data = this.transport.peek(1024*10);
     if (data) {
@@ -364,7 +427,11 @@ Connection.prototype.output = function () {
         if (debug) console.log('[' + this.id + '] returning from output(), wrote ' + buff.length + ' bytes of data');
         return true;
     } else {
-        if (debug) console.log('[' + this.id + '] returning from output(), nothing to write');
+        if (data === null) {
+            if (debug) console.log('[' + this.id + '] returning from output(), EOS');
+        } else {
+            if (debug) console.log('[' + this.id + '] returning from output(), nothing to write');
+        }
         return false;
     }
 };
@@ -404,16 +471,18 @@ Connection.prototype.unique_link_name = function (base) {
 };
 
 Connection.prototype.create_receiver = function (options) {
-    var name = this.unique_link_name(options.name ? options.name : this.generate_link_name(options.source, options.target));
-    var receiver = new Receiver(this, this.session().create_receiver(name, options));
+    var opts = options ? options : {};
+    var name = this.unique_link_name(opts.name ? opts.name : this.generate_link_name(opts.source, opts.target));
+    var receiver = new Receiver(this, this.session().create_receiver(name, opts), opts);
     this.links[receiver.name] = receiver;
     this.process();
     return receiver;
 };
 
 Connection.prototype.create_sender = function (options) {
-    var name = this.unique_link_name(options.name ? options.name : this.generate_link_name(options.source, options.target));
-    var sender = new Sender(this, this.session().create_sender(name, options));
+    var opts = options ? options : {};
+    var name = this.unique_link_name(opts.name ? opts.name : this.generate_link_name(opts.source, opts.target));
+    var sender = new Sender(this, this.session().create_sender(name, opts));
     this.links[sender.name] = sender;
     this.process();
     return sender;
@@ -433,7 +502,7 @@ Container.prototype = Object.create(EventEmitter.prototype);
 Container.prototype.constructor = Container;
 
 Container.prototype.connect = function (options) {
-    return new Connection(this).connect(options);
+    return new Connection(this, options).connect();
 };
 
 Container.prototype.listen = function (options) {
@@ -443,6 +512,7 @@ Container.prototype.listen = function (options) {
         var c = new Connection(container);
         console.log('[' + c.id + '] client accepted: '+ get_socket_id(socket));
         c.initialise(socket);
+        c.connected();
     });
     server.listen(options.port);
     return server;
